@@ -1,0 +1,3 @@
+# chzzk PyInstaller 빌드·일시정지( psutil )용. 로컬/CI에서: pip install -r requirements.txt
+pyinstaller>=6.0
+psutil>=5.0
