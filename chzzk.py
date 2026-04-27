@@ -13,7 +13,8 @@
   URL 칸에 **한 줄에 하나**로 여러 개 넣으면 **위→아래 순(큐)으로 연속** 다운로드.
   개별 URL이 실패해도 **다음 URL은 계속** 시도하며, 실패한 항목은 **`저장 폴더/chzzk_failed.log`** 에 탭 구분으로 누적.
   기본 저장 파일명: **`[YYYY_MM_DD]_제목.mp4`** (`publishDateAt` 기준, 없으면 오늘 날짜).
-- 기본 품질: ffprobe로 **1080p(가능할 때 FHD 를 우선** 선택) 후 `-c copy` 로 **MP4** mux. ffprobe 는 ffmpeg 설치에 함께 옵니다.
+- **화질(세로)**: GUI·`--quality`로 **0(가용 최대)·2160~360 등** 상한을 고르고, ffprobe로 manifest 안에서 그 **이하**인 변형+오디오를 골라 `-c copy`로 MP4(기본 1080p). **용량을 더 줄이려면** 「재인코딩」 또는 `--reencode`.
+- ffprobe 는 ffmpeg 설치에 함께 옵니다.
 
 왜 ffmpeg? 다시보기는 브라우저에 보이는 주소가 “한 통짜 mp4 링크”가 아니라 m3u8/MPD 등으로
 여러 조각(세그먼트)으로 전송됩니다. URL만 알면 그 조각들을 받아 한 파일로 합치는 도구가 필요하고,
@@ -104,13 +105,33 @@ UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# ffprobe로 최대한 맞출 세로해상도 (FHD)
-TARGET_VIDEO_HEIGHT = 1080
+# target_h: 0 = manifest에서 가용한 최대 세로(해상도), >0 = 해당 p 이하·가장 가까운 변형(없으면 그보다 큰 최저)
+DEFAULT_TARGET_HEIGHT = 1080
+# 하위호환(내부 기본)
+TARGET_VIDEO_HEIGHT = DEFAULT_TARGET_HEIGHT
 
 VIDEO_RE = re.compile(
     r"https?://(?:(?:m|www)\.)?chzzk\.naver\.com/video/(?P<id>\d+)(?:[/?#].*)?$",
     re.IGNORECASE,
 )
+
+# (세로 p, Combobox 표시)
+QUALITY_GUI_OPTIONS: tuple[tuple[int, str], ...] = (
+    (0, "최고 (가용 최대)"),
+    (2160, "2160p 4K (가용 시)"),
+    (1440, "1440p (가용 시)"),
+    (1080, "1080p Full HD (기본)"),
+    (720, "720p"),
+    (480, "480p"),
+    (360, "360p"),
+)
+
+
+def _height_from_gui_quality_label(label: str) -> int:
+    for h, lab in QUALITY_GUI_OPTIONS:
+        if lab == label:
+            return h
+    return DEFAULT_TARGET_HEIGHT
 
 
 def _log_download_failure(log_dir: str, url: str, err: str) -> None:
@@ -296,17 +317,19 @@ def _ffmpeg_headers(cookie_header: str) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
-def _ffprobe_map_args_for_1080p(
-    input_url: str, headers: str, target_h: int = TARGET_VIDEO_HEIGHT
+def _ffprobe_map_args_for_target_height(
+    input_url: str, headers: str, target_h: int
 ) -> tuple[list[str], str]:
     """
     ffprobe로 비디오·오디오 인덱스를 찾아 -map 0:… 인자로 반환.
-    목표 target_h(기본 1080)에 맞는 변형을 고르고, 없으면 1080 이하 최대 또는 1080 초과 시 가장 낮은 쪽.
+    target_h==0: 가용 비디오 중 세로가 가장 큰 것.
+    target_h>0: 정확 일치·없으면 target_h 이하 최대, 모두 그보다 크면 가장 낮은 것(스트림).
     """
     if not shutil.which("ffprobe"):
+        goal = "최고" if not target_h else f"≤{target_h}p"
         return (
             [],
-            f"ffprobe 없음(자동 스트림) — {target_h}p 선호(ffmpeg·ffprobe 같이 설치 권장)",
+            f"ffprobe 없음(자동 스트림) — {goal} 선호(ffmpeg·ffprobe 같이 설치 권장)",
         )
     wn: dict[str, Any] = _subprocess_win_hide_console()
     try:
@@ -362,15 +385,18 @@ def _ffprobe_map_args_for_1080p(
     if not cands:
         chosen: dict[str, Any] = vids[0]
     else:
-        h1080 = [s for s in cands if h(s) == target_h]
-        if h1080:
-            chosen = h1080[0]
+        if not target_h:
+            chosen = max(cands, key=lambda s: h(s))
         else:
-            under = [s for s in cands if h(s) <= target_h]
-            if under:
-                chosen = max(under, key=lambda s: h(s))
+            exact = [s for s in cands if h(s) == target_h]
+            if exact:
+                chosen = exact[0]
             else:
-                chosen = min(cands, key=lambda s: h(s))
+                under = [s for s in cands if h(s) <= target_h]
+                if under:
+                    chosen = max(under, key=lambda s: h(s))
+                else:
+                    chosen = min(cands, key=lambda s: h(s))
     hi = h(chosen) or int(str(chosen.get("height") or 0) or 0)
     try:
         wi = int(chosen.get("width") or 0)
@@ -392,12 +418,17 @@ def _ffprobe_map_args_for_1080p(
     args: list[str] = ["-map", f"0:{vix}"]
     if aidx is not None:
         args += ["-map", f"0:{aidx}"]
-    if hi == target_h and wi and hi:
+    if not target_h:
+        if hi and wi:
+            label = f"{wi}x{hi} (최고 화질)"
+        else:
+            label = f"stream 0:{vix} (최고)"
+    elif hi == target_h and wi and hi:
         label = f"{wi}x{hi} ({target_h}p)"
     elif hi:
-        label = f"{wi}x{hi} (가용, 목표 {target_h}p)"
+        label = f"{wi}x{hi} (가용, 목표 ≤{target_h}p)"
     else:
-        label = f"stream 0:{vix} (목표 {target_h}p)"
+        label = f"stream 0:{vix} (목표 ≤{target_h}p)"
     return args, label
 
 
@@ -446,12 +477,80 @@ def _ffmpeg_time_to_seconds(m: re.Match[str]) -> float:
     return int(h) * 3600 + int(mm) * 60 + float(s)
 
 
+def _default_reencode_crf(vcodec: str) -> int:
+    v = (vcodec or "h264").lower()
+    return 28 if v in ("hevc", "h265", "x265") else 24
+
+
+def _build_reencode_ffmpeg_args(
+    *,
+    reencode: bool,
+    reencode_vcodec: str,
+    reencode_crf: int | None,
+    reencode_preset: str,
+) -> list[str]:
+    if not reencode:
+        return ["-c", "copy"]
+    v = (reencode_vcodec or "h264").lower()
+    if v in ("hevc", "h265", "x265"):
+        crf = reencode_crf if reencode_crf is not None else _default_reencode_crf("hevc")
+        return [
+            "-c:v",
+            "libx265",
+            "-crf",
+            str(crf),
+            "-preset",
+            reencode_preset,
+            "-pix_fmt",
+            "yuv420p",
+            "-tag:v",
+            "hvc1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ]
+    crf = reencode_crf if reencode_crf is not None else _default_reencode_crf("h264")
+    return [
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-preset",
+        reencode_preset,
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+    ]
+
+
+def _reencode_status_note(
+    reencode: bool, reencode_vcodec: str, reencode_crf: int | None, reencode_preset: str
+) -> str:
+    if not reencode:
+        return ""
+    v = (reencode_vcodec or "h264").lower()
+    crf = reencode_crf if reencode_crf is not None else _default_reencode_crf(
+        "hevc" if v in ("hevc", "h265", "x265") else "h264"
+    )
+    enc = "HEVC" if v in ("hevc", "h265", "x265") else "H.264"
+    return f"재인코딩 {enc} CRF{crf} {reencode_preset}"
+
+
 def _run_ffmpeg(
     input_url: str,
     output_path: str,
     cookie_header: str,
     print_cmd: bool,
     *,
+    reencode: bool = False,
+    reencode_vcodec: str = "h264",
+    reencode_crf: int | None = None,
+    reencode_preset: str = "medium",
+    target_height: int = DEFAULT_TARGET_HEIGHT,
     on_progress: Callable[[float | None, str | None], None] | None = None,
     duration_sec: float | None = None,
     on_ffmpeg_start: Callable[[Any], None] | None = None,
@@ -459,7 +558,21 @@ def _run_ffmpeg(
     if not shutil.which("ffmpeg"):
         raise ChzzkError(_ffmpeg_missing_message())
     headers = _ffmpeg_headers(cookie_header)
-    map_args, qnote = _ffprobe_map_args_for_1080p(input_url, headers, TARGET_VIDEO_HEIGHT)
+    th = int(target_height) if target_height is not None else DEFAULT_TARGET_HEIGHT
+    if th < 0:
+        th = DEFAULT_TARGET_HEIGHT
+    map_args, qnote = _ffprobe_map_args_for_target_height(input_url, headers, th)
+    renote = _reencode_status_note(
+        reencode, reencode_vcodec, reencode_crf, reencode_preset
+    )
+    if reencode and renote:
+        qnote = f"{qnote} | {renote}" if qnote else renote
+    enc_args = _build_reencode_ffmpeg_args(
+        reencode=reencode,
+        reencode_vcodec=reencode_vcodec,
+        reencode_crf=reencode_crf,
+        reencode_preset=reencode_preset,
+    )
     if not on_progress:
         print(f"화질: {qnote}", file=sys.stderr)
     loglevel = "info"
@@ -474,8 +587,7 @@ def _run_ffmpeg(
         "-i",
         input_url,
         *map_args,
-        "-c",
-        "copy",
+        *enc_args,
         "-f",
         "mp4",
         "-movflags",
@@ -524,7 +636,10 @@ def _run_ffmpeg(
     if proc.stderr is None:
         raise ChzzkError("ffmpeg stderr 파이프를 열 수 없습니다.")
     dtot = float(duration_sec) if duration_sec and duration_sec > 0 else 0.0
-    _emit(None, "다운로드 중(스트림)…")
+    _emit(
+        None,
+        "다운로드·인코딩 중…" if reencode else "다운로드 중(스트림)…",
+    )
     for line in proc.stderr:
         line = line.rstrip()
         m = _FFMPEG_TIME_RE.search(line)
@@ -541,7 +656,7 @@ def _run_ffmpeg(
     if rc != 0:
         raise ChzzkError(f"ffmpeg 실패(종료 {rc})")
     if on_progress:
-        _emit(1.0, "복사·mux 완료 (MP4)")
+        _emit(1.0, "인코딩·저장 완료" if reencode else "복사·mux 완료 (MP4)")
 
 
 def _format_hms(seconds: float) -> str:
@@ -707,13 +822,63 @@ def _run_gui() -> None:
     btn_browse = ttk.Button(dir_frame, text="찾아보기…")
     btn_browse.grid(row=0, column=2, padx=(6, 0))
 
+    qual_frame = ttk.Frame(frm)
+    qual_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    qual_frame.grid_columnconfigure(1, weight=1)
+    ttk.Label(qual_frame, text="화질(세로·상한)").grid(row=0, column=0, padx=(0, 8))
+    _qlabels = [lab for _, lab in QUALITY_GUI_OPTIONS]
+    var_quality = tk.StringVar(
+        value=next(l for h, l in QUALITY_GUI_OPTIONS if h == DEFAULT_TARGET_HEIGHT)
+    )
+    cb_quality = ttk.Combobox(
+        qual_frame,
+        textvariable=var_quality,
+        state="readonly",
+        width=42,
+        values=_qlabels,
+    )
+    cb_quality.grid(row=0, column=1, sticky="w")
+    ttk.Label(
+        qual_frame,
+        text="manifest에 있는 변형 중 위에 맞는 것(없으면 가장 가까운 쪽).",
+        font=(None, 8),
+        wraplength=520,
+    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    enc_frame = ttk.LabelFrame(frm, text="용량(선택)", padding=6)
+    enc_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    var_reencode = tk.BooleanVar(value=False)
+    var_reencode_vcodec = tk.StringVar(value="h264")
+    ttk.Checkbutton(
+        enc_frame,
+        text="재인코딩(파일이 작아지고, 걸리는 시간·CPU는 늘어남, 화질은 손실)",
+        variable=var_reencode,
+    ).pack(anchor="w")
+    row_enc2 = ttk.Frame(enc_frame)
+    row_enc2.pack(fill=tk.X, pady=(4, 0))
+    ttk.Label(row_enc2, text="비디오:").pack(side=tk.LEFT, padx=(0, 6))
+    cb_reenc_v = ttk.Combobox(
+        row_enc2,
+        textvariable=var_reencode_vcodec,
+        state="readonly",
+        width=18,
+        values=("h264", "hevc"),
+    )
+    cb_reenc_v.pack(side=tk.LEFT)
+    ttk.Label(
+        enc_frame,
+        text="(기본 H.264 CRF 24, AAC 128k / HEVC는 용량 더↓·인코딩 더 느림, ffmpeg에 libx265 필요)",
+        font=(None, 8),
+        wraplength=520,
+    ).pack(anchor="w", pady=(4, 0))
+
     pbar = ttk.Progressbar(frm, mode="determinate", length=400, maximum=100)
-    pbar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+    pbar.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 4))
     lbl_status = ttk.Label(frm, text="대기 중", font=(None, 9))
-    lbl_status.grid(row=4, column=0, columnspan=2, sticky="w")
+    lbl_status.grid(row=6, column=0, columnspan=2, sticky="w")
 
     fr_btns = ttk.Frame(frm)
-    fr_btns.grid(row=5, column=0, columnspan=2, pady=(10, 0))
+    fr_btns.grid(row=7, column=0, columnspan=2, pady=(10, 0))
     btn_go = ttk.Button(fr_btns, text="다운로드", width=16)
     btn_go.pack(side=tk.LEFT, padx=(0, 6))
     btn_pause = ttk.Button(fr_btns, text="일시정지", width=10, state=tk.DISABLED)
@@ -809,7 +974,7 @@ def _run_gui() -> None:
         except ChzzkError as e:
             messagebox.showerror("일시정지", str(e))
 
-    def work() -> None:
+    def work(reenc: bool, reenc_vcodec: str, target_h: int) -> None:
         try:
             urls = _parse_url_list(txt_url.get("1.0", tk.END))
             folder = ent_dir.get().strip()
@@ -849,15 +1014,21 @@ def _run_gui() -> None:
                 ev = threading.Event()
 
                 def init_pbar(
-                    dur: float | None, ki: int, ni: int
+                    dur: float | None,
+                    ki: int,
+                    ni: int,
+                    use_reenc: bool,
+                    th: int,
                 ) -> None:
                     if dur and dur > 0:
                         pbar.configure(mode="determinate", value=0.0, maximum=100.0)
                     else:
                         pbar.configure(mode="indeterminate")
                         pbar.start(8)
+                    phase = "재인코딩" if use_reenc else "다운로드(스트림·MP4)"
+                    goal = "최고" if th <= 0 else f"≤{th}p"
                     lbl_status.configure(
-                        text=f"[{ki}/{ni}] 다운로드 중(1080p·MP4)…"
+                        text=f"[{ki}/{ni}] {phase} 중(목표 {goal})…"
                     )
                     ev.set()
 
@@ -879,7 +1050,12 @@ def _run_gui() -> None:
                     _log_download_failure(folder, url, em)
                     failed.append((url, em))
                     continue
-                root.after(0, lambda d=dur, ki=k, ni=n: init_pbar(d, ki, ni))
+                root.after(
+                    0,
+                    lambda d=dur, ki=k, ni=n, ur=reenc, th=target_h: init_pbar(
+                        d, ki, ni, ur, th
+                    ),
+                )
                 if not ev.wait(timeout=10.0):
                     em = "초기화 시간 초과."
                     _log_download_failure(folder, url, em)
@@ -924,6 +1100,9 @@ def _run_gui() -> None:
                         out_path,
                         cookie_line,
                         False,
+                        reencode=reenc,
+                        reencode_vcodec=reenc_vcodec,
+                        target_height=target_h,
                         on_progress=on_ff,
                         duration_sec=dur,
                         on_ffmpeg_start=on_start_proc,
@@ -954,13 +1133,36 @@ def _run_gui() -> None:
         lbl_status.configure(text="정보를 불러오는 중…")
         pbar["mode"] = "determinate"
         pbar["value"] = 0.0
-        threading.Thread(target=work, daemon=True).start()
+        reenc = var_reencode.get()
+        reenc_v = (var_reencode_vcodec.get() or "h264").strip().lower()
+        if reenc_v not in ("h264", "hevc"):
+            reenc_v = "h264"
+        target_h = _height_from_gui_quality_label(var_quality.get() or "")
+        threading.Thread(
+            target=work, args=(reenc, reenc_v, target_h), daemon=True
+        ).start()
 
     btn_browse.configure(command=browse_dir)
     btn_go.configure(command=start)
     btn_pause.configure(command=toggle_pause)
     txt_url.focus_set()
     root.mainloop()
+
+
+def _parse_quality_cli(s: str) -> int:
+    t = (s or "").strip().lower().rstrip("p")
+    if t in ("best", "max", "highest", "최고", "최상", "0"):
+        return 0
+    n = int(t, 10)
+    if n < 0:
+        raise argparse.ArgumentTypeError("화질(세로)은 0 이상이어야 합니다.")
+    if n == 0:
+        return 0
+    if n < 64 or n > 7680:
+        raise argparse.ArgumentTypeError(
+            "화질(세로)은 0(최고) 또는 64~7680(예: 1080)이어야 합니다."
+        )
+    return n
 
 
 def main() -> None:
@@ -1002,6 +1204,40 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="스크림 URL만 표시하고 ffmpeg는 실행하지 않음",
+    )
+    p.add_argument(
+        "--quality",
+        type=_parse_quality_cli,
+        default=DEFAULT_TARGET_HEIGHT,
+        metavar="H",
+        help=(
+            "비디오 세로 해상도(상한, ffprobe·manifest). "
+            "0=가용 최대, 1080,720,480,360,best(=0) 등. 기본 1080"
+        ),
+    )
+    p.add_argument(
+        "--reencode",
+        action="store_true",
+        help="재인코딩(용량↓·시간↑). H.264 또는 HEVC + AAC(기본 H.264 CRF 24, medium)",
+    )
+    p.add_argument(
+        "--reencode-vcodec",
+        choices=("h264", "hevc"),
+        default="h264",
+        metavar="K",
+        help="재인코딩 비디오 코덱(기본 h264; hevc는 ffmpeg에 libx265 필요, 더 느림)",
+    )
+    p.add_argument(
+        "--reencode-crf",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CRF(낮을수록 화질↑·용량↑). h264 기본 24, hevc 기본 28(미지정 시)",
+    )
+    p.add_argument(
+        "--reencode-preset",
+        default="medium",
+        help="x264/x265 preset(기본 medium; ultrafast~veryslow)",
     )
     args = p.parse_args()
 
@@ -1060,12 +1296,23 @@ def main() -> None:
                     print("type:", kind)
                     print("stream_url:", stream_url)
                     print("output:", out)
+                    print("quality (target height):", args.quality)
                     continue
                 print(
                     f"다운로드({nurls}중): {title or video_id} -> {out}",
                     file=sys.stderr,
                 )
-                _run_ffmpeg(stream_url, out, cookie_header, print_cmd=False)
+                _run_ffmpeg(
+                    stream_url,
+                    out,
+                    cookie_header,
+                    print_cmd=False,
+                    reencode=bool(args.reencode),
+                    reencode_vcodec=args.reencode_vcodec,
+                    reencode_crf=args.reencode_crf,
+                    reencode_preset=args.reencode_preset,
+                    target_height=int(args.quality),
+                )
                 ok_paths.append(out)
             except ChzzkError as e:
                 em = str(e)
