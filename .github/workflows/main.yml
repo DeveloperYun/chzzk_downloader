@@ -1,0 +1,51 @@
+# chzzk.py → chzzk.exe (Windows, PyInstaller)
+# Artifacts: Actions 탭 → 해당 워크플로 실행 결과에서 dist/chzzk.exe 다운로드
+
+name: Build chzzk (Windows exe)
+
+on:
+  push:
+    paths:
+      - "chzzk.py"
+      - "chzzk.spec"
+      - ".github/workflows/build-chzzk-windows.yml"
+  pull_request:
+    paths:
+      - "chzzk.py"
+      - "chzzk.spec"
+      - ".github/workflows/build-chzzk-windows.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: chzzk-windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller>=6.0"
+
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --clean chzzk.spec
+
+      - name: Upload chzzk.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: chzzk-windows-exe
+          path: dist/chzzk.exe
+          if-no-files-found: error
