@@ -9,17 +9,18 @@
   예: Netscape 쿠키 파일(--cookies) 또는 --cookie "NID_SES=...; NID_AUT=..."
   환경 변수 CHZZK_COOKIE 도 동일 형식으로 지정 가능합니다.
 
-- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·일시정지·진행률·완료 알림)  
-  URL 칸에 **한 줄에 하나**로 여러 개 넣으면 **위→아래 순(큐)으로 연속** 다운로드.  
+- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·일시정지·진행률·완료 알림)
+  URL 칸에 **한 줄에 하나**로 여러 개 넣으면 **위→아래 순(큐)으로 연속** 다운로드.
   개별 URL이 실패해도 **다음 URL은 계속** 시도하며, 실패한 항목은 **`저장 폴더/chzzk_failed.log`** 에 탭 구분으로 누적.
+  기본 저장 파일명: **`[YYYY_MM_DD]_제목.mp4`** (`publishDateAt` 기준, 없으면 오늘 날짜).
 - 기본 품질: ffprobe로 **1080p(가능할 때 FHD 를 우선** 선택) 후 `-c copy` 로 **MP4** mux. ffprobe 는 ffmpeg 설치에 함께 옵니다.
 
 왜 ffmpeg? 다시보기는 브라우저에 보이는 주소가 “한 통짜 mp4 링크”가 아니라 m3u8/MPD 등으로
 여러 조각(세그먼트)으로 전송됩니다. URL만 알면 그 조각들을 받아 한 파일로 합치는 도구가 필요하고,
 이 스크립트는 그 역할에 ffmpeg를 사용합니다. (터미널에서 `ffmpeg -version`이 나오면 준비된 것.)
 
-- **Ubuntu/Debian(소스 실행):** `sudo apt update && sudo apt install -y python3-tk ffmpeg`  
-  (`python3-tk` = GUI용 tkinter, `ffmpeg` = 스트림 합치기). 무화면 서버는 GUI 대신  
+- **Ubuntu/Debian(소스 실행):** `sudo apt update && sudo apt install -y python3-tk ffmpeg`
+  (`python3-tk` = GUI용 tkinter, `ffmpeg` = 스트림 합치기). 무화면 서버는 GUI 대신
   `python3 chzzk.py 'https://…' -o 저장.mp4` 처럼 CLI만 사용하세요.
 - **Windows(소스 실행):** ffmpeg 설치 후 PATH. 예: `winget install Gyan.FFmpeg` 또는
   https://www.gyan.dev/ffmpeg/builds/ 의 `bin`을 PATH에 추가. 새 터미널에서 `ffmpeg -version` 확인.
@@ -36,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -171,6 +172,25 @@ def _resolve_cookie_arg(cookie_file: str | None, cookie: str | None) -> str:
     return (os.environ.get("CHZZK_COOKIE") or "").strip()
 
 
+def _normalize_cookie_header(s: str) -> str:
+    """
+    HTTP Cookie 값에는 CR/LF가 올 수 없다(httplib/urllib ValueError).
+    GUI 등에서 쿠키를 여러 줄로 붙여넣은 경우 `name=값` 조각을 `; `로 잇는다.
+    """
+    if not s or not str(s).strip():
+        return ""
+    pieces: list[str] = []
+    for block in str(s).replace("\r", "\n").split("\n"):
+        block = block.strip()
+        if not block:
+            continue
+        for p in block.split(";"):
+            p = p.strip()
+            if p and "=" in p:
+                pieces.append(p)
+    return "; ".join(pieces)
+
+
 def _api_request(
     video_id: str, cookie_header: str, extra_headers: dict[str, str] | None = None
 ) -> dict[str, Any]:
@@ -183,7 +203,7 @@ def _api_request(
     if extra_headers:
         h.update(extra_headers)
     if cookie_header:
-        h["Cookie"] = cookie_header
+        h["Cookie"] = _normalize_cookie_header(cookie_header)
     req = urllib.request.Request(url, headers=h, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -270,7 +290,9 @@ def _ffmpeg_headers(cookie_header: str) -> str:
         "Referer: https://chzzk.naver.com/",
     ]
     if cookie_header:
-        lines.append(f"Cookie: {cookie_header}")
+        c = _normalize_cookie_header(cookie_header)
+        if c:
+            lines.append(f"Cookie: {c}")
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -542,9 +564,29 @@ def _duration_from_content(content: dict[str, Any]) -> float | None:
     return v if v > 0 else None
 
 
-def _default_out_path(video_id: str, title: str | None) -> str:
-    safe = re.sub(r"[^\w가-힣.-]+", "_", (title or f"chzzk_{video_id}"))[:120]
-    safe = safe.strip("._") or f"chzzk_{video_id}"
+def _date_prefix_from_content(content: dict[str, Any] | None) -> str:
+    """저장 파일명 앞: [YYYY_MM_DD]_ (API publishDateAt, 없으면 로컬 오늘)."""
+    dt = datetime.now().astimezone()
+    if content:
+        raw = content.get("publishDateAt")
+        if raw is not None:
+            try:
+                f = float(raw)
+                if f > 1e12:  # ms
+                    f /= 1000.0
+                dt = datetime.fromtimestamp(f, tz=timezone.utc).astimezone()
+            except (OSError, ValueError, OverflowError, TypeError):
+                pass
+    return f"[{dt.year:04d}_{dt.month:02d}_{dt.day:02d}]_"
+
+
+def _default_out_path(
+    video_id: str, title: str | None, content: dict[str, Any] | None = None
+) -> str:
+    pre = _date_prefix_from_content(content)
+    body = re.sub(r"[^\w가-힣.-]+", "_", (title or f"chzzk_{video_id}"))[:120]
+    body = body.strip("._") or f"chzzk_{video_id}"
+    safe = (f"{pre}{body}")[:200]
     return f"{safe}.mp4"
 
 
@@ -559,10 +601,14 @@ def _unique_path(path: str) -> str:
 
 
 def _cli_resolved_path(
-    video_id: str, title: str | None, out_arg: str | None, nurls: int
+    video_id: str,
+    title: str | None,
+    out_arg: str | None,
+    nurls: int,
+    content: dict[str, Any] | None = None,
 ) -> str:
     """CLI -o: URL 1개 → 파일·폴더 모두 가능. 2개 이상 → -o 는 폴더(또는 생략=현재 디렉터리)."""
-    fn = _default_out_path(video_id, title)
+    fn = _default_out_path(video_id, title, content)
     if nurls == 1:
         if not out_arg:
             p = fn if fn.lower().endswith(".mp4") else f"{fn}.mp4"
@@ -607,7 +653,7 @@ def _run_gui() -> None:
 
     lf_cookie = ttk.LabelFrame(
         frm,
-        text="쿠키 (선택) — 19금·연령 제한 VOD",
+        text="쿠키 (선택) — 연령 제한 VOD",
         padding=8,
     )
     lf_cookie.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 8))
@@ -824,7 +870,7 @@ def _run_gui() -> None:
                     continue
                 dur = _duration_from_content(content)
                 title = (content.get("videoTitle") or "").strip() or None
-                fname = _default_out_path(video_id, title)
+                fname = _default_out_path(video_id, title, content)
                 out_path = _unique_path(os.path.join(folder, fname))
                 try:
                     stream_url, _ = _stream_url_from_content(content)
@@ -1006,7 +1052,7 @@ def main() -> None:
                     )
                 title = (content.get("videoTitle") or "").strip() or None
                 out = _cli_resolved_path(
-                    video_id, title, args.output, nurls
+                    video_id, title, args.output, nurls, content
                 )
                 stream_url, kind = _stream_url_from_content(content)
                 if args.dry_run:
