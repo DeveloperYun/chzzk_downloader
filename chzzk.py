@@ -9,13 +9,18 @@
   예: Netscape 쿠키 파일(--cookies) 또는 --cookie "NID_SES=...; NID_AUT=..."
   환경 변수 CHZZK_COOKIE 도 동일 형식으로 지정 가능합니다.
 
-- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·진행률·완료 알림)
+- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·일시정지·진행률·완료 알림)
+- 기본 품질: ffprobe로 **1080p(가능할 때 FHD 를 우선** 선택) 후 `-c copy` 로 **MP4** mux. ffprobe 는 ffmpeg 설치에 함께 옵니다.
 
 왜 ffmpeg? 다시보기는 브라우저에 보이는 주소가 “한 통짜 mp4 링크”가 아니라 m3u8/MPD 등으로
 여러 조각(세그먼트)으로 전송됩니다. URL만 알면 그 조각들을 받아 한 파일로 합치는 도구가 필요하고,
 이 스크립트는 그 역할에 ffmpeg를 사용합니다. (터미널에서 `ffmpeg -version`이 나오면 준비된 것.)
-Windows: `winget install Gyan.FFmpeg` 이후 새 창을 연 뒤 PATH 반영, 또는
-https://www.gyan.dev/ffmpeg/builds/ 에서 받은 `bin`을 환경 변수 PATH에 추가.
+
+- **Ubuntu/Debian(소스 실행):** `sudo apt update && sudo apt install -y python3-tk ffmpeg`  
+  (`python3-tk` = GUI용 tkinter, `ffmpeg` = 스트림 합치기). 무화면 서버는 GUI 대신  
+  `python3 chzzk.py 'https://…' -o 저장.mp4` 처럼 CLI만 사용하세요.
+- **Windows(소스 실행):** ffmpeg 설치 후 PATH. 예: `winget install Gyan.FFmpeg` 또는
+  https://www.gyan.dev/ffmpeg/builds/ 의 `bin`을 PATH에 추가. 새 터미널에서 `ffmpeg -version` 확인.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -93,6 +99,9 @@ UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# ffprobe로 최대한 맞출 세로해상도 (FHD)
+TARGET_VIDEO_HEIGHT = 1080
 
 VIDEO_RE = re.compile(
     r"https?://(?:(?:m|www)\.)?chzzk\.naver\.com/video/(?P<id>\d+)(?:[/?#].*)?$",
@@ -231,6 +240,148 @@ def _ffmpeg_headers(cookie_header: str) -> str:
     return "\r\n".join(lines) + "\r\n"
 
 
+def _ffprobe_map_args_for_1080p(
+    input_url: str, headers: str, target_h: int = TARGET_VIDEO_HEIGHT
+) -> tuple[list[str], str]:
+    """
+    ffprobe로 비디오·오디오 인덱스를 찾아 -map 0:… 인자로 반환.
+    목표 target_h(기본 1080)에 맞는 변형을 고르고, 없으면 1080 이하 최대 또는 1080 초과 시 가장 낮은 쪽.
+    """
+    if not shutil.which("ffprobe"):
+        return (
+            [],
+            f"ffprobe 없음(자동 스트림) — {target_h}p 선호(ffmpeg·ffprobe 같이 설치 권장)",
+        )
+    wn: dict[str, Any] = _subprocess_win_hide_console()
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-probesize",
+                "32M",
+                "-analyzeduration",
+                "20M",
+                "-headers",
+                headers,
+                "-i",
+                input_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            **wn,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return [], f"ffprobe 실패(건너뜀): {e!s}"[:220]
+    if r.returncode != 0:
+        return [], f"ffprobe 오류(건너뜀): {(r.stderr or '')[:200]}"
+    try:
+        j: dict[str, Any] = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return [], "ffprobe JSON 파싱 실패(건너뜀)"
+    streams: list[dict[str, Any]] = list(j.get("streams") or [])
+    vids: list[dict[str, Any]] = []
+    auds: list[dict[str, Any]] = []
+    for s in streams:
+        ct = s.get("codec_type")
+        if ct == "video":
+            vids.append(s)
+        elif ct == "audio":
+            auds.append(s)
+    if not vids:
+        return [], "비디오 스트림 없음(건너뜀)"
+
+    def h(s: dict[str, Any]) -> int:
+        try:
+            return int(s.get("height") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    cands = [s for s in vids if h(s) > 0]
+    if not cands:
+        chosen: dict[str, Any] = vids[0]
+    else:
+        h1080 = [s for s in cands if h(s) == target_h]
+        if h1080:
+            chosen = h1080[0]
+        else:
+            under = [s for s in cands if h(s) <= target_h]
+            if under:
+                chosen = max(under, key=lambda s: h(s))
+            else:
+                chosen = min(cands, key=lambda s: h(s))
+    hi = h(chosen) or int(str(chosen.get("height") or 0) or 0)
+    try:
+        wi = int(chosen.get("width") or 0)
+    except (TypeError, ValueError):
+        wi = 0
+    aidx: int | None = None
+    if auds:
+        try:
+            aidx = int(auds[0].get("index", -1))
+        except (TypeError, ValueError):
+            aidx = None
+        if aidx is not None and aidx < 0:
+            aidx = None
+    vix: int | None
+    try:
+        vix = int(chosen["index"])
+    except (TypeError, ValueError, KeyError):
+        return [], "비디오 인덱스 없음(건너뜀)"
+    args: list[str] = ["-map", f"0:{vix}"]
+    if aidx is not None:
+        args += ["-map", f"0:{aidx}"]
+    if hi == target_h and wi and hi:
+        label = f"{wi}x{hi} ({target_h}p)"
+    elif hi:
+        label = f"{wi}x{hi} (가용, 목표 {target_h}p)"
+    else:
+        label = f"stream 0:{vix} (목표 {target_h}p)"
+    return args, label
+
+
+def _ffmpeg_set_paused(proc: subprocess.Popen, pause: bool) -> None:
+    """psutil(가능 시) 또는 Linux SIGSTOP/SIGCONT으로 ffmpeg를 일시정지/재개."""
+    if proc.poll() is not None:
+        return
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            p = psutil.Process(proc.pid)
+            if pause:
+                p.suspend()
+            else:
+                p.resume()
+            return
+        except Exception as e:
+            raise ChzzkError(f"일시정지/재개 실패: {e}") from e
+    if (
+        sys.platform != "win32"
+        and getattr(signal, "SIGSTOP", None) is not None
+        and getattr(signal, "SIGCONT", None) is not None
+    ):
+        try:
+            if pause:
+                os.kill(proc.pid, signal.SIGSTOP)
+            else:
+                os.kill(proc.pid, signal.SIGCONT)
+        except (ProcessLookupError, OSError) as e:
+            raise ChzzkError(f"일시정지/재개 실패: {e}") from e
+        return
+    raise ChzzkError(
+        "이 환경에서는 일시정지를 지원하지 못합니다. `pip install psutil` 을 설치하거나, "
+        "지원 Linux에서 SIGSTOP 를 사용하세요."
+    )
+
+
 _FFMPEG_TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
 
 
@@ -247,12 +398,16 @@ def _run_ffmpeg(
     *,
     on_progress: Callable[[float | None, str | None], None] | None = None,
     duration_sec: float | None = None,
+    on_ffmpeg_start: Callable[[Any], None] | None = None,
 ) -> None:
     if not shutil.which("ffmpeg"):
         raise ChzzkError(_ffmpeg_missing_message())
     headers = _ffmpeg_headers(cookie_header)
-    loglevel = "info" if on_progress else "info"
-    cmd = [
+    map_args, qnote = _ffprobe_map_args_for_1080p(input_url, headers, TARGET_VIDEO_HEIGHT)
+    if not on_progress:
+        print(f"화질: {qnote}", file=sys.stderr)
+    loglevel = "info"
+    cmd: list[str] = [
         "ffmpeg",
         "-hide_banner",
         "-y",
@@ -262,8 +417,11 @@ def _run_ffmpeg(
         headers,
         "-i",
         input_url,
+        *map_args,
         "-c",
         "copy",
+        "-f",
+        "mp4",
         "-movflags",
         "+faststart",
         output_path,
@@ -274,7 +432,19 @@ def _run_ffmpeg(
             f"[ff] headers bytes={hlen}, input URL(scheme+host hidden)=...",
             file=sys.stderr,
         )
-    win = _subprocess_win_hide_console()
+    win: dict[str, Any] = _subprocess_win_hide_console()
+
+    def _emit(frac: float | None, msg: str) -> None:
+        if on_progress is None:
+            return
+        if qnote and msg:
+            line = f"{qnote}  |  {msg}"
+        elif qnote:
+            line = qnote
+        else:
+            line = msg
+        on_progress(frac, line)
+
     if on_progress is None:
         try:
             subprocess.run(cmd, check=True, **win)
@@ -293,26 +463,29 @@ def _run_ffmpeg(
         )
     except OSError as e:
         raise ChzzkError(f"ffmpeg 실행 실패: {e}") from e
+    if on_ffmpeg_start is not None:
+        on_ffmpeg_start(proc)
     if proc.stderr is None:
         raise ChzzkError("ffmpeg stderr 파이프를 열 수 없습니다.")
     dtot = float(duration_sec) if duration_sec and duration_sec > 0 else 0.0
+    _emit(None, "다운로드 중(스트림)…")
     for line in proc.stderr:
         line = line.rstrip()
         m = _FFMPEG_TIME_RE.search(line)
         if m and dtot > 0:
             tsec = _ffmpeg_time_to_seconds(m)
-            on_progress(
+            _emit(
                 min(0.999, max(0.0, tsec / dtot)),
                 f"{_format_hms(tsec)} / {_format_hms(dtot)}",
             )
-        elif on_progress and m and dtot <= 0:
+        elif m and dtot <= 0:
             tsec = _ffmpeg_time_to_seconds(m)
-            on_progress(None, f"진행: {_format_hms(tsec)} (총 길이는 API에 없음)")
+            _emit(None, f"진행: {_format_hms(tsec)} (총 길이는 API에 없음)")
     rc = proc.wait()
     if rc != 0:
         raise ChzzkError(f"ffmpeg 실패(종료 {rc})")
     if on_progress:
-        on_progress(1.0, "인코딩/복사 완료")
+        _emit(1.0, "복사·mux 완료 (MP4)")
 
 
 def _format_hms(seconds: float) -> str:
@@ -433,8 +606,14 @@ def _run_gui() -> None:
     lbl_status = ttk.Label(frm, text="대기 중", font=(None, 9))
     lbl_status.grid(row=4, column=0, columnspan=2, sticky="w")
 
-    btn_go = ttk.Button(frm, text="다운로드", width=18)
-    btn_go.grid(row=5, column=0, columnspan=2, pady=(10, 0))
+    fr_btns = ttk.Frame(frm)
+    fr_btns.grid(row=5, column=0, columnspan=2, pady=(10, 0))
+    btn_go = ttk.Button(fr_btns, text="다운로드", width=16)
+    btn_go.pack(side=tk.LEFT, padx=(0, 6))
+    btn_pause = ttk.Button(fr_btns, text="일시정지", width=10, state=tk.DISABLED)
+    btn_pause.pack(side=tk.LEFT)
+
+    ff_state: dict[str, Any] = {"proc": None, "paused": False}
 
     def browse_dir() -> None:
         d = filedialog.askdirectory(
@@ -457,6 +636,7 @@ def _run_gui() -> None:
         pbar["value"] = 100.0
         lbl_status.configure(text="완료")
         btn_go.configure(state=tk.NORMAL)
+        btn_pause.configure(state=tk.DISABLED, text="일시정지")
         messagebox.showinfo("다운로드 완료", f"다운로드가 완료되었습니다.\n\n{path}")
 
     def on_done_err(err: str) -> None:
@@ -464,69 +644,103 @@ def _run_gui() -> None:
         pbar["value"] = 0.0
         lbl_status.configure(text="오류")
         btn_go.configure(state=tk.NORMAL)
+        btn_pause.configure(state=tk.DISABLED, text="일시정지")
         messagebox.showerror("오류", err)
 
-    def work() -> None:
-        url = ent_url.get().strip()
-        folder = ent_dir.get().strip()
-        cookie_line = txt_cook.get("1.0", tk.END).strip()
-        if not url:
-            root.after(0, lambda: on_done_err("다시보기 URL을 입력하세요."))
-            return
-        if not folder or not os.path.isdir(folder):
-            root.after(0, lambda: on_done_err("유효한 다운로드 폴더를 선택하세요."))
-            return
-        m = VIDEO_RE.search(url)
-        if not m:
-            root.after(0, lambda: on_done_err("URL 형식: https://chzzk.naver.com/video/숫자"))
-            return
-        video_id = m.group("id")
-        ev = threading.Event()
+    def _detach_ffmpeg() -> None:
+        ff_state["proc"] = None
+        ff_state["paused"] = False
+        btn_pause.configure(state=tk.DISABLED, text="일시정지")
 
-        def init_pbar(dur: float | None) -> None:
-            if dur and dur > 0:
-                pbar.configure(mode="determinate", value=0.0, maximum=100.0)
+    def toggle_pause() -> None:
+        proc = ff_state.get("proc")
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            if not ff_state.get("paused"):
+                _ffmpeg_set_paused(proc, True)
+                ff_state["paused"] = True
+                btn_pause.configure(text="재개")
+                lbl_status.configure(text="일시정지 — 재개를 누르면 이어서 받습니다")
             else:
-                pbar.configure(mode="indeterminate")
-                pbar.start(8)
-            lbl_status.configure(text="다운로드 중…")
-            ev.set()
-
-        try:
-            content = _api_request(video_id, cookie_line)
+                _ffmpeg_set_paused(proc, False)
+                ff_state["paused"] = False
+                btn_pause.configure(text="일시정지")
+                lbl_status.configure(text="이어서 받는 중…")
         except ChzzkError as e:
-            root.after(0, lambda s=str(e): on_done_err(s))
-            return
-        dur = _duration_from_content(content)
-        title = (content.get("videoTitle") or "").strip() or None
-        fname = _default_out_path(video_id, title)
-        out_path = _unique_path(os.path.join(folder, fname))
+            messagebox.showerror("일시정지", str(e))
+
+    def work() -> None:
         try:
-            stream_url, _ = _stream_url_from_content(content)
-        except ChzzkError as e:
-            root.after(0, lambda s=str(e): on_done_err(s))
-            return
-        root.after(0, lambda: init_pbar(dur))
-        if not ev.wait(timeout=10.0):
-            root.after(0, lambda: on_done_err("초기화 시간 초과."))
-            return
+            url = ent_url.get().strip()
+            folder = ent_dir.get().strip()
+            cookie_line = txt_cook.get("1.0", tk.END).strip()
+            if not url:
+                root.after(0, lambda: on_done_err("다시보기 URL을 입력하세요."))
+                return
+            if not folder or not os.path.isdir(folder):
+                root.after(0, lambda: on_done_err("유효한 다운로드 폴더를 선택하세요."))
+                return
+            m = VIDEO_RE.search(url)
+            if not m:
+                root.after(0, lambda: on_done_err("URL 형식: https://chzzk.naver.com/video/숫자"))
+                return
+            video_id = m.group("id")
+            ev = threading.Event()
 
-        def on_ff(frac: float | None, msg: str | None) -> None:
-            def _u() -> None:
-                if frac is not None:
-                    try:
-                        pbar.stop()
-                    except tk.TclError:
-                        pass
-                    pbar["mode"] = "determinate"
-                    v = min(100.0, max(0.0, 100.0 * float(frac)))
-                    pbar["value"] = v
-                if msg:
-                    lbl_status.configure(text=msg)
+            def init_pbar(dur: float | None) -> None:
+                if dur and dur > 0:
+                    pbar.configure(mode="determinate", value=0.0, maximum=100.0)
+                else:
+                    pbar.configure(mode="indeterminate")
+                    pbar.start(8)
+                lbl_status.configure(text="다운로드 중(1080p·MP4)…")
+                ev.set()
 
-            root.after(0, _u)
+            try:
+                content = _api_request(video_id, cookie_line)
+            except ChzzkError as e:
+                root.after(0, lambda s=str(e): on_done_err(s))
+                return
+            dur = _duration_from_content(content)
+            title = (content.get("videoTitle") or "").strip() or None
+            fname = _default_out_path(video_id, title)
+            out_path = _unique_path(os.path.join(folder, fname))
+            try:
+                stream_url, _ = _stream_url_from_content(content)
+            except ChzzkError as e:
+                root.after(0, lambda s=str(e): on_done_err(s))
+                return
+            root.after(0, lambda: init_pbar(dur))
+            if not ev.wait(timeout=10.0):
+                root.after(0, lambda: on_done_err("초기화 시간 초과."))
+                return
 
-        try:
+            def on_ff(frac: float | None, msg: str | None) -> None:
+                def _u() -> None:
+                    if ff_state.get("paused"):
+                        return
+                    if frac is not None:
+                        try:
+                            pbar.stop()
+                        except tk.TclError:
+                            pass
+                        pbar["mode"] = "determinate"
+                        v = min(100.0, max(0.0, 100.0 * float(frac)))
+                        pbar["value"] = v
+                    if msg:
+                        lbl_status.configure(text=msg)
+
+                root.after(0, _u)
+
+            def on_start_proc(p: Any) -> None:
+                def _bind() -> None:
+                    ff_state["proc"] = p
+                    ff_state["paused"] = False
+                    btn_pause.configure(state=tk.NORMAL, text="일시정지")
+
+                root.after(0, _bind)
+
             _run_ffmpeg(
                 stream_url,
                 out_path,
@@ -534,18 +748,23 @@ def _run_gui() -> None:
                 False,
                 on_progress=on_ff,
                 duration_sec=dur,
+                on_ffmpeg_start=on_start_proc,
             )
+            root.after(0, lambda p=out_path: on_done_ok(p))
         except ChzzkError as e:
             root.after(0, lambda s=str(e): on_done_err(s))
-            return
-        root.after(0, lambda p=out_path: on_done_ok(p))
+        finally:
+            root.after(0, _detach_ffmpeg)
 
     def start() -> None:
         try:
             pbar.stop()
         except tk.TclError:
             pass
+        ff_state["proc"] = None
+        ff_state["paused"] = False
         btn_go.configure(state=tk.DISABLED)
+        btn_pause.configure(state=tk.DISABLED, text="일시정지")
         lbl_status.configure(text="정보를 불러오는 중…")
         pbar["mode"] = "determinate"
         pbar["value"] = 0.0
@@ -553,6 +772,7 @@ def _run_gui() -> None:
 
     btn_browse.configure(command=browse_dir)
     btn_go.configure(command=start)
+    btn_pause.configure(command=toggle_pause)
     ent_url.focus_set()
     root.mainloop()
 
