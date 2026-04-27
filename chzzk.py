@@ -13,8 +13,9 @@
 
 왜 ffmpeg? 다시보기는 브라우저에 보이는 주소가 “한 통짜 mp4 링크”가 아니라 m3u8/MPD 등으로
 여러 조각(세그먼트)으로 전송됩니다. URL만 알면 그 조각들을 받아 한 파일로 합치는 도구가 필요하고,
-이 스크립트는 그 역할에 ffmpeg를 사용합니다. (패키지 설치 후 터미널에서 `ffmpeg -version` 이
-나오면 준비된 것입니다.)
+이 스크립트는 그 역할에 ffmpeg를 사용합니다. (터미널에서 `ffmpeg -version`이 나오면 준비된 것.)
+Windows: `winget install Gyan.FFmpeg` 이후 새 창을 연 뒤 PATH 반영, 또는
+https://www.gyan.dev/ffmpeg/builds/ 에서 받은 `bin`을 환경 변수 PATH에 추가.
 """
 
 from __future__ import annotations
@@ -42,6 +43,49 @@ except ImportError:  # pragma: no cover
 
 class ChzzkError(Exception):
     pass
+
+
+def _subprocess_win_hide_console() -> dict[str, Any]:
+    """Windows에서 ffmpeg를 띄울 때 콘솔(검은 창)이 잠깐 뜨는 것을 막는다 (GUI용)."""
+    if sys.platform != "win32":
+        return {}
+    c = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return {"creationflags": c} if c else {}
+
+
+def _ffmpeg_missing_message() -> str:
+    if sys.platform == "win32":
+        return (
+            "ffmpeg 를 찾을 수 없습니다.\n\n"
+            "[Windows] 설치 예:\n"
+            "  · PowerShell:  winget install Gyan.FFmpeg\n"
+            "  · 또는 gyan.dev 에서 full 빌드 zip → 압축 해제 후 `bin` 폴더를\n"
+            "    ‘환경 변수’의 PATH(사용자)에 넣기\n\n"
+            "설정 후 **새로 연** 터미널/창에서 `ffmpeg -version` 이 되는지 확인하세요."
+        )
+    return "ffmpeg 를 찾을 수 없습니다. 시스템에 설치한 뒤 PATH에 등록하세요."
+
+
+def _default_downloads_dir() -> str:
+    if sys.platform == "win32":
+        home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    else:
+        home = os.path.expanduser("~")
+    cand = os.path.join(home, "Downloads")
+    return cand if os.path.isdir(cand) else home
+
+
+def _utf8_console_if_windows() -> None:
+    if sys.platform != "win32":
+        return
+    for s in (sys.stdout, sys.stderr):
+        reconf = getattr(s, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, TypeError):
+            pass
 
 CHZZK_API = "https://api.chzzk.naver.com/service/v3/videos/{}"
 PLAYBACK = "https://apis.naver.com/neonplayer/vodplay/v1/playback/{}"
@@ -205,7 +249,7 @@ def _run_ffmpeg(
     duration_sec: float | None = None,
 ) -> None:
     if not shutil.which("ffmpeg"):
-        raise ChzzkError("ffmpeg 를 찾을 수 없습니다. 시스템에 설치한 뒤 PATH에 등록하세요.")
+        raise ChzzkError(_ffmpeg_missing_message())
     headers = _ffmpeg_headers(cookie_header)
     loglevel = "info" if on_progress else "info"
     cmd = [
@@ -230,9 +274,10 @@ def _run_ffmpeg(
             f"[ff] headers bytes={hlen}, input URL(scheme+host hidden)=...",
             file=sys.stderr,
         )
+    win = _subprocess_win_hide_console()
     if on_progress is None:
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, **win)
         except subprocess.CalledProcessError as e:
             raise ChzzkError(f"ffmpeg 실패(종료 {e.returncode})") from e
         return
@@ -242,6 +287,9 @@ def _run_ffmpeg(
             stderr=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            **win,
         )
     except OSError as e:
         raise ChzzkError(f"ffmpeg 실행 실패: {e}") from e
@@ -304,12 +352,11 @@ def _unique_path(path: str) -> str:
 
 
 def _run_gui() -> None:
+    _utf8_console_if_windows()
     if tk is None:
         print("tkinter 를 사용할 수 없습니다.", file=sys.stderr)
         sys.exit(1)
-    default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-    if not os.path.isdir(default_dir):
-        default_dir = os.path.expanduser("~")
+    default_dir = _default_downloads_dir()
 
     root = tk.Tk()
     root.title("치지직 VOD 다운로드")
@@ -511,6 +558,7 @@ def _run_gui() -> None:
 
 
 def main() -> None:
+    _utf8_console_if_windows()
     p = argparse.ArgumentParser(
         description="치지직 다시보기 VOD 를 ffmpeg로 내려받습니다 (HLS/MPD). "
         "인자 없이 실행하면 GUI가 열립니다.",
