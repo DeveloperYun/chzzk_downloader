@@ -9,7 +9,9 @@
   예: Netscape 쿠키 파일(--cookies) 또는 --cookie "NID_SES=...; NID_AUT=..."
   환경 변수 CHZZK_COOKIE 도 동일 형식으로 지정 가능합니다.
 
-- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·일시정지·진행률·완료 알림)
+- GUI: 인자 없이 실행, 또는 `python chzzk.py --gui` / `-g` (URL·쿠키·저장 폴더·일시정지·진행률·완료 알림)  
+  URL 칸에 **한 줄에 하나**로 여러 개 넣으면 **위→아래 순(큐)으로 연속** 다운로드.  
+  개별 URL이 실패해도 **다음 URL은 계속** 시도하며, 실패한 항목은 **`저장 폴더/chzzk_failed.log`** 에 탭 구분으로 누적.
 - 기본 품질: ffprobe로 **1080p(가능할 때 FHD 를 우선** 선택) 후 `-c copy` 로 **MP4** mux. ffprobe 는 ffmpeg 설치에 함께 옵니다.
 
 왜 ffmpeg? 다시보기는 브라우저에 보이는 주소가 “한 통짜 mp4 링크”가 아니라 m3u8/MPD 등으로
@@ -34,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -107,6 +110,37 @@ VIDEO_RE = re.compile(
     r"https?://(?:(?:m|www)\.)?chzzk\.naver\.com/video/(?P<id>\d+)(?:[/?#].*)?$",
     re.IGNORECASE,
 )
+
+
+def _log_download_failure(log_dir: str, url: str, err: str) -> None:
+    """
+    배치 다운로드에서 한 URL이 실패했을 때 log_dir에 chzzk_failed.log 로 한 줄씩 누적.
+    (다음 URL 다운로드는 이미 루프에서 계속됨)
+    """
+    if not log_dir or not os.path.isdir(log_dir):
+        return
+    path = os.path.join(log_dir, "chzzk_failed.log")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    one = (err or "").replace("\n", " ").replace("\r", " ").strip()[:2000]
+    line = f"{ts}\t{url}\t{one}\n"
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _parse_url_list(text: str) -> list[str]:
+    """
+    한 줄에 하나(또는 # 주석) 다시보기 URL. 앞뒤 공백·빈 줄 제거.
+    """
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
 
 
 def _parse_netscape_cookie_file(path: str) -> str:
@@ -524,6 +558,29 @@ def _unique_path(path: str) -> str:
     return f"{base} ({n}){ext}"
 
 
+def _cli_resolved_path(
+    video_id: str, title: str | None, out_arg: str | None, nurls: int
+) -> str:
+    """CLI -o: URL 1개 → 파일·폴더 모두 가능. 2개 이상 → -o 는 폴더(또는 생략=현재 디렉터리)."""
+    fn = _default_out_path(video_id, title)
+    if nurls == 1:
+        if not out_arg:
+            p = fn if fn.lower().endswith(".mp4") else f"{fn}.mp4"
+            return _unique_path(p)
+        o = os.path.normpath(out_arg)
+        if os.path.isdir(o):
+            return _unique_path(os.path.join(o, os.path.basename(fn)))
+        p = o if o.lower().endswith(".mp4") else f"{o}.mp4"
+        return _unique_path(p)
+    if out_arg and not os.path.isdir(out_arg):
+        raise ChzzkError(
+            "URL이 둘 이상일 때는 -o(또는 --output)에 저장 '폴더'만 지정하세요. "
+            f" ({out_arg!r} 은 폴더가 아닙니다.)"
+        )
+    base = os.path.normpath(out_arg) if out_arg else os.getcwd()
+    return _unique_path(os.path.join(base, os.path.basename(fn)))
+
+
 def _run_gui() -> None:
     _utf8_console_if_windows()
     if tk is None:
@@ -541,9 +598,12 @@ def _run_gui() -> None:
     frm.grid(row=0, column=0, sticky="nsew")
     frm.grid_columnconfigure(1, weight=1)
 
-    ttk.Label(frm, text="다시보기 URL").grid(row=0, column=0, sticky="nw", pady=(0, 4))
-    ent_url = ttk.Entry(frm, width=60)
-    ent_url.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+    ttk.Label(frm, text="다시보기 URL(줄마다 1개, 위→아래 순)").grid(
+        row=0, column=0, sticky="nw", pady=(0, 4)
+    )
+    txt_url = scrolledtext.ScrolledText(frm, height=5, width=64, font=(None, 9))
+    txt_url.grid(row=0, column=1, sticky="nsew", pady=(0, 4))
+    frm.rowconfigure(0, weight=1)
 
     lf_cookie = ttk.LabelFrame(
         frm,
@@ -631,13 +691,46 @@ def _run_gui() -> None:
             pass
         pbar["mode"] = "determinate"
 
-    def on_done_ok(path: str) -> None:
+    def on_batch_done(
+        success: list[str],
+        failed: list[tuple[str, str]],
+        log_dir: str | None = None,
+    ) -> None:
         stop_indeterminate()
-        pbar["value"] = 100.0
-        lbl_status.configure(text="완료")
+        pbar["value"] = 100.0 if success else 0.0
+        lbl_status.configure(
+            text=f"완료 {len(success)}개, 실패 {len(failed)}개" if failed else "완료"
+        )
         btn_go.configure(state=tk.NORMAL)
         btn_pause.configure(state=tk.DISABLED, text="일시정지")
-        messagebox.showinfo("다운로드 완료", f"다운로드가 완료되었습니다.\n\n{path}")
+        log_note = (
+            f"\n\n실패 URL·사유는 로그에 누적했습니다:\n{os.path.join(log_dir, 'chzzk_failed.log')}"
+            if (failed and log_dir)
+            else ""
+        )
+        if failed and not success:
+            body = "\n".join(f"· {u}\n  {em[:200]}" for u, em in failed[:8])
+            if len(failed) > 8:
+                body += f"\n… 외 {len(failed) - 8}건"
+            messagebox.showerror("다운로드", f"모두 실패했습니다.\n\n{body}{log_note}")
+        elif failed:
+            ok_lines = "\n".join(success[:6])
+            if len(success) > 6:
+                ok_lines += f"\n… 외 {len(success) - 6}개"
+            fail_body = "\n".join(f"· {u[:60]}…\n  {em[:120]}" for u, em in failed[:5])
+            if len(failed) > 5:
+                fail_body += f"\n… 외 {len(failed) - 5}건"
+            messagebox.showwarning(
+                "다운로드 일부 실패",
+                f"성공 {len(success)}개, 실패 {len(failed)}개 (다음 URL은 계속 진행)\n\n"
+                f"[저장됨]\n{ok_lines}\n\n[실패]\n{fail_body}{log_note}",
+            )
+        else:
+            lines = "\n".join(success[:10])
+            if len(success) > 10:
+                lines += f"\n… 외 {len(success) - 10}개"
+            t = f"{len(success)}개 모두 저장했습니다." if len(success) > 1 else "저장 완료."
+            messagebox.showinfo("다운로드 완료", f"{t}\n\n{lines}")
 
     def on_done_err(err: str) -> None:
         stop_indeterminate()
@@ -672,85 +765,132 @@ def _run_gui() -> None:
 
     def work() -> None:
         try:
-            url = ent_url.get().strip()
+            urls = _parse_url_list(txt_url.get("1.0", tk.END))
             folder = ent_dir.get().strip()
             cookie_line = txt_cook.get("1.0", tk.END).strip()
-            if not url:
-                root.after(0, lambda: on_done_err("다시보기 URL을 입력하세요."))
+            if not urls:
+                root.after(0, lambda: on_done_err("다시보기 URL을 한 줄에 하나씩 입력하세요."))
                 return
             if not folder or not os.path.isdir(folder):
                 root.after(0, lambda: on_done_err("유효한 다운로드 폴더를 선택하세요."))
                 return
-            m = VIDEO_RE.search(url)
-            if not m:
-                root.after(0, lambda: on_done_err("URL 형식: https://chzzk.naver.com/video/숫자"))
-                return
-            video_id = m.group("id")
-            ev = threading.Event()
-
-            def init_pbar(dur: float | None) -> None:
-                if dur and dur > 0:
-                    pbar.configure(mode="determinate", value=0.0, maximum=100.0)
-                else:
-                    pbar.configure(mode="indeterminate")
-                    pbar.start(8)
-                lbl_status.configure(text="다운로드 중(1080p·MP4)…")
-                ev.set()
-
-            try:
-                content = _api_request(video_id, cookie_line)
-            except ChzzkError as e:
-                root.after(0, lambda s=str(e): on_done_err(s))
-                return
-            dur = _duration_from_content(content)
-            title = (content.get("videoTitle") or "").strip() or None
-            fname = _default_out_path(video_id, title)
-            out_path = _unique_path(os.path.join(folder, fname))
-            try:
-                stream_url, _ = _stream_url_from_content(content)
-            except ChzzkError as e:
-                root.after(0, lambda s=str(e): on_done_err(s))
-                return
-            root.after(0, lambda: init_pbar(dur))
-            if not ev.wait(timeout=10.0):
-                root.after(0, lambda: on_done_err("초기화 시간 초과."))
+            bad = [u for u in urls if not VIDEO_RE.search(u)]
+            if bad:
+                root.after(
+                    0,
+                    lambda: on_done_err(
+                        "URL 형식이 올바르지 않은 줄이 있습니다.\n"
+                        + "https://chzzk.naver.com/video/숫자\n\n"
+                        + "\n".join(bad[:5])
+                        + (f"\n… 외 {len(bad) - 5}줄" if len(bad) > 5 else "")
+                    ),
+                )
                 return
 
-            def on_ff(frac: float | None, msg: str | None) -> None:
-                def _u() -> None:
-                    if ff_state.get("paused"):
-                        return
-                    if frac is not None:
-                        try:
-                            pbar.stop()
-                        except tk.TclError:
-                            pass
-                        pbar["mode"] = "determinate"
-                        v = min(100.0, max(0.0, 100.0 * float(frac)))
-                        pbar["value"] = v
-                    if msg:
-                        lbl_status.configure(text=msg)
+            n = len(urls)
+            success: list[str] = []
+            failed: list[tuple[str, str]] = []
 
-                root.after(0, _u)
+            for i, url in enumerate(urls):
+                k = i + 1
+                m = VIDEO_RE.search(url)
+                if not m:
+                    em = "URL 인식 실패(내부 오류)"
+                    _log_download_failure(folder, url, em)
+                    failed.append((url, em))
+                    continue
+                video_id = m.group("id")
+                ev = threading.Event()
 
-            def on_start_proc(p: Any) -> None:
-                def _bind() -> None:
-                    ff_state["proc"] = p
-                    ff_state["paused"] = False
-                    btn_pause.configure(state=tk.NORMAL, text="일시정지")
+                def init_pbar(
+                    dur: float | None, ki: int, ni: int
+                ) -> None:
+                    if dur and dur > 0:
+                        pbar.configure(mode="determinate", value=0.0, maximum=100.0)
+                    else:
+                        pbar.configure(mode="indeterminate")
+                        pbar.start(8)
+                    lbl_status.configure(
+                        text=f"[{ki}/{ni}] 다운로드 중(1080p·MP4)…"
+                    )
+                    ev.set()
 
-                root.after(0, _bind)
+                try:
+                    content = _api_request(video_id, cookie_line)
+                except ChzzkError as e:
+                    em = str(e)
+                    _log_download_failure(folder, url, em)
+                    failed.append((url, em))
+                    continue
+                dur = _duration_from_content(content)
+                title = (content.get("videoTitle") or "").strip() or None
+                fname = _default_out_path(video_id, title)
+                out_path = _unique_path(os.path.join(folder, fname))
+                try:
+                    stream_url, _ = _stream_url_from_content(content)
+                except ChzzkError as e:
+                    em = str(e)
+                    _log_download_failure(folder, url, em)
+                    failed.append((url, em))
+                    continue
+                root.after(0, lambda d=dur, ki=k, ni=n: init_pbar(d, ki, ni))
+                if not ev.wait(timeout=10.0):
+                    em = "초기화 시간 초과."
+                    _log_download_failure(folder, url, em)
+                    failed.append((url, em))
+                    continue
 
-            _run_ffmpeg(
-                stream_url,
-                out_path,
-                cookie_line,
-                False,
-                on_progress=on_ff,
-                duration_sec=dur,
-                on_ffmpeg_start=on_start_proc,
+                def on_ff(
+                    frac: float | None,
+                    msg: str | None,
+                    *,
+                    k: int = k,
+                    n: int = n,
+                ) -> None:
+                    def _u() -> None:
+                        if ff_state.get("paused"):
+                            return
+                        if frac is not None:
+                            try:
+                                pbar.stop()
+                            except tk.TclError:
+                                pass
+                            pbar["mode"] = "determinate"
+                            g = min(1.0, max(0.0, float(frac)))
+                            overall = 100.0 * ((k - 1) + g) / n
+                            pbar["value"] = min(100.0, max(0.0, overall))
+                        if msg:
+                            lbl_status.configure(text=f"[{k}/{n}] {msg}")
+
+                    root.after(0, _u)
+
+                def on_start_proc(p: Any) -> None:
+                    def _bind() -> None:
+                        ff_state["proc"] = p
+                        ff_state["paused"] = False
+                        btn_pause.configure(state=tk.NORMAL, text="일시정지")
+
+                    root.after(0, _bind)
+
+                try:
+                    _run_ffmpeg(
+                        stream_url,
+                        out_path,
+                        cookie_line,
+                        False,
+                        on_progress=on_ff,
+                        duration_sec=dur,
+                        on_ffmpeg_start=on_start_proc,
+                    )
+                    success.append(out_path)
+                except ChzzkError as e:
+                    em = str(e)
+                    _log_download_failure(folder, url, em)
+                    failed.append((url, em))
+            root.after(
+                0,
+                lambda s=success, f=failed, fd=folder: on_batch_done(s, f, fd),
             )
-            root.after(0, lambda p=out_path: on_done_ok(p))
         except ChzzkError as e:
             root.after(0, lambda s=str(e): on_done_err(s))
         finally:
@@ -773,7 +913,7 @@ def _run_gui() -> None:
     btn_browse.configure(command=browse_dir)
     btn_go.configure(command=start)
     btn_pause.configure(command=toggle_pause)
-    ent_url.focus_set()
+    txt_url.focus_set()
     root.mainloop()
 
 
@@ -785,12 +925,13 @@ def main() -> None:
     )
     p.add_argument(
         "url",
-        help="https://chzzk.naver.com/video/<id> 형식",
+        nargs="+",
+        help="https://chzzk.naver.com/video/<id> (여러 개면 순서대로). 한 개만 쓰면 -o에 파일도 가능.",
     )
     p.add_argument(
         "-o",
         "--output",
-        help="출력 mp4 경로(미지정 시 제목 기반 파일명)",
+        help="출력: URL 1개일 때 .mp4 파일 경로 가능. 여러 URL이면 이 값은 '저장 폴더'여야 합니다.",
     )
     p.add_argument(
         "--cookie",
@@ -819,36 +960,84 @@ def main() -> None:
     args = p.parse_args()
 
     try:
-        m = VIDEO_RE.search(args.url.strip())
-        if not m:
+        urls = [u.strip() for u in args.url if u.strip()]
+        nurls = len(urls)
+        if not urls:
+            raise ChzzkError("URL이 없습니다.")
+        bad = [u for u in urls if not VIDEO_RE.search(u)]
+        if bad:
             raise ChzzkError(
-                "chzzk 다시보기 URL만 지원합니다. 예: https://chzzk.naver.com/video/1234567"
+                "지원하지 않는 URL이 있습니다.\n" + "\n".join(bad[:10])
             )
-        video_id = m.group("id")
         cookie_header = _resolve_cookie_arg(args.cookies, args.cookie)
-
-        content = _api_request(video_id, cookie_header)
-        if args.print_json:
-            print(json.dumps(content, ensure_ascii=False, indent=2), file=sys.stderr)
-
-        title = (content.get("videoTitle") or "").strip() or None
-        out = args.output
-        if not out:
-            out = _default_out_path(video_id, title)
-        if not out.lower().endswith(".mp4"):
-            out = out + ".mp4"
-
-        stream_url, kind = _stream_url_from_content(content)
-        if args.dry_run:
-            print("video_id:", video_id)
-            print("type:", kind)
-            print("stream_url:", stream_url)
-            print("output:", out)
-            return
-
-        print(f"다운로드: {title or video_id} -> {out}", file=sys.stderr)
-        _run_ffmpeg(stream_url, out, cookie_header, print_cmd=False)
-        print(out)
+        if nurls > 1:
+            log_dir = (
+                args.output
+                if (args.output and os.path.isdir(args.output))
+                else os.getcwd()
+            )
+        else:
+            if args.output:
+                o = os.path.normpath(args.output)
+                if os.path.isdir(o):
+                    log_dir = o
+                else:
+                    ad = os.path.dirname(os.path.abspath(o))
+                    log_dir = ad if ad else os.getcwd()
+            else:
+                log_dir = os.getcwd()
+        ok_paths: list[str] = []
+        err: list[tuple[str, str]] = []
+        for url in urls:
+            m = VIDEO_RE.search(url)
+            if not m:
+                em = "URL 인식 실패(parse)"
+                if not args.dry_run:
+                    _log_download_failure(log_dir, url, em)
+                err.append((url, em))
+                continue
+            video_id = m.group("id")
+            try:
+                content = _api_request(video_id, cookie_header)
+                if args.print_json:
+                    print(
+                        json.dumps(content, ensure_ascii=False, indent=2),
+                        file=sys.stderr,
+                    )
+                title = (content.get("videoTitle") or "").strip() or None
+                out = _cli_resolved_path(
+                    video_id, title, args.output, nurls
+                )
+                stream_url, kind = _stream_url_from_content(content)
+                if args.dry_run:
+                    print("video_id:", video_id)
+                    print("type:", kind)
+                    print("stream_url:", stream_url)
+                    print("output:", out)
+                    continue
+                print(
+                    f"다운로드({nurls}중): {title or video_id} -> {out}",
+                    file=sys.stderr,
+                )
+                _run_ffmpeg(stream_url, out, cookie_header, print_cmd=False)
+                ok_paths.append(out)
+            except ChzzkError as e:
+                em = str(e)
+                if not args.dry_run:
+                    _log_download_failure(log_dir, url, em)
+                err.append((url, em))
+        if not args.dry_run:
+            for p in ok_paths:
+                print(p)
+        if not args.dry_run and err:
+            for u, m in err:
+                print(f"실패: {u} :: {m}", file=sys.stderr)
+            print(
+                f"실패 {len(err)}건 → 로그: {os.path.join(log_dir, 'chzzk_failed.log')}",
+                file=sys.stderr,
+            )
+        if not args.dry_run and not ok_paths and err:
+            sys.exit(1)
     except ChzzkError as e:
         print(str(e), file=sys.stderr)
         sys.exit(1)
