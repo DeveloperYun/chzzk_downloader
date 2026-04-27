@@ -8,11 +8,13 @@ on:
     paths:
       - "chzzk.py"
       - "chzzk.spec"
+      - "requirements.txt"
       - ".github/workflows/build-chzzk.yml"
   pull_request:
     paths:
       - "chzzk.py"
       - "chzzk.spec"
+      - "requirements.txt"
       - ".github/workflows/build-chzzk.yml"
   workflow_dispatch: {}
 
@@ -50,11 +52,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install PyInstaller
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "pyinstaller>=6.0" psutil
+          python -m pip install -r requirements.txt
 
       - name: Build
         run: |
